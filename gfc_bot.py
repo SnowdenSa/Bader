@@ -22,10 +22,11 @@ from typing import Literal
 # 1. أنواع البيانات
 # ────────────────────────────────────────────
 
-TrendDir = Literal["UP", "DOWN", "RANGE", "UNKNOWN"]
-Zone     = Literal["SUPPORT", "RESISTANCE", "MIDDLE"]
-Signal   = Literal["BUY_GRAND_BREAK", "BUY", "SELL_GRAND_BREAK",
-                   "SELL", "NO_TRADE", "WAIT"]
+TrendDir     = Literal["UP", "DOWN", "RANGE", "UNKNOWN"]
+Zone         = Literal["SUPPORT", "RESISTANCE", "MIDDLE"]
+Signal       = Literal["BUY_GRAND_BREAK", "BUY", "SELL_GRAND_BREAK",
+                       "SELL", "NO_TRADE", "WAIT"]
+EntryStrength = Literal["STRONG", "MEDIUM", "WEAK", "NONE"]
 
 
 @dataclass
@@ -46,18 +47,20 @@ class BreakStatus:
 
 @dataclass
 class GFCResult:
-    grand       : TrendLevel
-    parent      : TrendLevel
-    child       : TrendLevel
-    grand_break : BreakStatus
-    parent_break: BreakStatus
-    price       : float
-    support     : float
-    resistance  : float
-    zone        : Zone
-    signal      : Signal
-    reason      : str
-    action      : str = field(default="")
+    grand        : TrendLevel
+    parent       : TrendLevel
+    child        : TrendLevel
+    grand_break  : BreakStatus
+    parent_break : BreakStatus
+    child_break  : BreakStatus
+    price        : float
+    support      : float
+    resistance   : float
+    zone         : Zone
+    signal       : Signal
+    entry_strength: EntryStrength
+    reason       : str
+    action       : str = field(default="")
 
 
 # ────────────────────────────────────────────
@@ -121,7 +124,45 @@ def detect_break(trend: TrendLevel, price: float,
 
 
 # ────────────────────────────────────────────
-# 4. الدعم والمقاومة
+# 4. State Machine — قوة الدخول
+# ────────────────────────────────────────────
+
+def classify_entry_strength(
+    gb: BreakStatus,    # grand break
+    pb: BreakStatus,    # parent break
+    cb: BreakStatus,    # child break
+    signal: Signal,
+    zone: Zone,
+) -> EntryStrength:
+    """
+    State Machine — يحدد قوة إشارة الدخول:
+
+    🟢 STRONG  — كسر الجد   → أقوى إشارة، انعكاس رئيسي
+    🟠 MEDIUM  — كسر الابن  → تغيير هيكلي، دخول متوسط
+    🟡 WEAK    — كسر الحفيد → سكالب قصير، دخول مبكر بحذر
+    ⚪ NONE    — لا كسر في أي مستوى → انتظار
+    """
+    # 1. STRONG: كسر الجد (أعلى أولوية)
+    if gb.broken:
+        return "STRONG"
+
+    # 2. MEDIUM: كسر الابن (جد لم يُكسر)
+    if pb.broken:
+        return "MEDIUM"
+
+    # 3. WEAK: كسر الحفيد أو إشارة BUY/SELL من المنطقة الصحيحة
+    if cb.broken:
+        return "WEAK"
+
+    # إشارة BUY عند دعم أو SELL عند مقاومة بدون كسر = سكالب محتمل
+    if signal in ("BUY", "SELL") and zone in ("SUPPORT", "RESISTANCE"):
+        return "WEAK"
+
+    return "NONE"
+
+
+# ────────────────────────────────────────────
+# 6. الدعم والمقاومة
 # ────────────────────────────────────────────
 
 def find_sr(highs: list[float], lows: list[float],
@@ -145,7 +186,7 @@ def price_zone(price: float, support: float, resistance: float,
 
 
 # ────────────────────────────────────────────
-# 5. شجرة القرار الهرمي
+# 7. شجرة القرار الهرمي
 # ────────────────────────────────────────────
 
 def decide(grand: TrendDir, parent: TrendDir, child: TrendDir,
@@ -305,7 +346,7 @@ def decide(grand: TrendDir, parent: TrendDir, child: TrendDir,
 
 
 # ────────────────────────────────────────────
-# 6. البوت الرئيسي
+# 8. البوت الرئيسي
 # ────────────────────────────────────────────
 
 class GFCBot:
@@ -335,8 +376,9 @@ class GFCBot:
         child  = TrendLevel(classify_trend(child_highs,  child_lows),
                             child_highs, child_lows)
 
-        gb = detect_break(grand,  current_price)   # كسر الجد
-        pb = detect_break(parent, current_price)   # كسر الابن
+        gb = detect_break(grand,  current_price, margin=0.005)  # كسر الجد   (هامش 0.5%)
+        pb = detect_break(parent, current_price, margin=0.005)  # كسر الابن  (هامش 0.5%)
+        cb = detect_break(child,  current_price, margin=0.001)  # كسر الحفيد (هامش 0.1% — حركات صغيرة)
 
         support, resistance = find_sr(
             parent_highs + child_highs,
@@ -349,9 +391,11 @@ class GFCBot:
             grand.direction, parent.direction, child.direction, zone, gb, pb
         )
 
-        return GFCResult(grand, parent, child, gb, pb,
+        strength = classify_entry_strength(gb, pb, cb, signal, zone)
+
+        return GFCResult(grand, parent, child, gb, pb, cb,
                          current_price, support, resistance,
-                         zone, signal, reason, action)
+                         zone, signal, strength, reason, action)
 
     def report_manual(self, ticker: str, **kwargs) -> GFCResult:
         r = self.analyze_manual(**kwargs)
@@ -371,6 +415,12 @@ class GFCBot:
             "NO_TRADE"        : "⚪  لا تداول",
             "WAIT"            : "🟡  انتظار",
         }
+        STRENGTH = {
+            "STRONG" : "🟢🟢🟢 STRONG  — كسر الجد   (دخول كبير)",
+            "MEDIUM" : "🟠🟠⬜ MEDIUM  — كسر الابن  (دخول متوسط)",
+            "WEAK"   : "🟡⬜⬜ WEAK    — كسر الحفيد (سكالب / مبكر)",
+            "NONE"   : "⚪⚪⚪ NONE    — لا إشارة (انتظار)",
+        }
         bar = "═" * 54
 
         def break_str(b, label: str) -> str:
@@ -389,6 +439,7 @@ class GFCBot:
         print(f"  {'─'*50}")
         print(break_str(r.grand_break,  "🔑 كسر الجد  "))
         print(break_str(r.parent_break, "📌 كسر الابن "))
+        print(break_str(r.child_break,  "⚡ كسر الحفيد"))
         print(f"  {'─'*50}")
         print(f"  السعر    : {r.price:.4f}")
         print(f"  الدعم    : {r.support:.4f}")
@@ -399,6 +450,8 @@ class GFCBot:
         print(f"  {r.reason}")
         if r.action:
             print(f"  ➜  {r.action}")
+        print(f"  {'─'*50}")
+        print(f"  قوة الإشارة: {STRENGTH[r.entry_strength]}")
         print(f"{bar}\n")
 
     # ── اختياري: بيانات حقيقية ──
